@@ -1,7 +1,7 @@
 # Ladder Loss for Coherent Visual-Semantic Embedding (AAAI2020)
 
-Title: Ladder Loss for Coherent Visual-Semantic Embedding
-Authors: Mo Zhou, Zhenxing Niu, Le Wang, Zhanning Gao, Qilin Zhang, Gang Hua
+* **Title:** Ladder Loss for Coherent Visual-Semantic Embedding
+* **Authors:** Mo Zhou, Zhenxing Niu, Le Wang, Zhanning Gao, Qilin Zhang, Gang Hua
 
 ## Demonstration
 
