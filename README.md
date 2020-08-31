@@ -3,14 +3,11 @@
 * **Title:** Ladder Loss for Coherent Visual-Semantic Embedding
 * **Authors:** Mo Zhou, Zhenxing Niu, Le Wang, Zhanning Gao, Qilin Zhang, Gang Hua
 * **Preprint:** [https://arxiv.org/abs/1911.07528](https://arxiv.org/abs/1911.07528)
+* **Code:** [here](Code/)
 
 ## Poster
 
 ![poster](assets/ladderloss-poster-96dpi.png)
-
-## Code
-
-Coming soon.
 
 ## License & Bibtex
 
@@ -28,7 +25,3 @@ The code files are released under the [Apache-2.0 License](https://www.apache.or
   year={2019}
 }
 ```
-
-## Reference
-
-TODO
