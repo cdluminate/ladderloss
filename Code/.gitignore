@@ -1,0 +1,10 @@
+captions_train-val2014.zip
+coco.all.toks
+pool
+coco.all.res18
+coco.all.res152
+annotations/captions_val2014.json
+annotations/captions_train2014.json
+runs/
+__pycache__
+ladderloss.py.SpacySimMat.cache
