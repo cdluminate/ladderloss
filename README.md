@@ -18,6 +18,22 @@ directory are released under the
 
 The code files are released under the [Apache-2.0 License](https://www.apache.org/licenses/LICENSE-2.0).
 
+BibTex:
+
+```latex
+@inproceedings{zhou2020ladderloss,
+  title={Ladder Loss for Coherent Visual-Semantic Embedding},
+  author={Zhou, Mo and Niu, Zhenxing and Wang, Le and Gao, Zhanning and Zhang, Qilin and Hua, Gang},
+  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume={34},
+  number={07},
+  pages={13050--13057},
+  year={2020}
+}
+```
+
+In case if you want to cite the preprint version:
+
 ```latex
 @article{zhou2019ladderloss,
   title={Ladder Loss for Coherent Visual-Semantic Embedding},
