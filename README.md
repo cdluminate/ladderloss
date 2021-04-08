@@ -4,7 +4,7 @@
 * **Authors:** Mo Zhou, Zhenxing Niu, Le Wang, Zhanning Gao, Qilin Zhang, Gang Hua
 * **Preprint:** [https://arxiv.org/abs/1911.07528](https://arxiv.org/abs/1911.07528)
 * **AAAI:** [Volume 34 No. 7: AAAI Technical Tracks. Pages 13050-13057](https://aaai.org/ojs/index.php/AAAI/article/view/7006)
-* **Code:** [here](Code/)
+* **Materials:** [{Code}](Code/) [{Poster(SVG)}](assets/aaai2215.svg) [{Slides}](assets/aaai2215.pdf)
 
 ## Poster
 
