@@ -20,7 +20,7 @@ The code files are released under the [Apache-2.0 License](https://www.apache.or
 
 BibTex:
 
-```latex
+```bib
 @inproceedings{zhou2020ladderloss,
   title={Ladder Loss for Coherent Visual-Semantic Embedding},
   author={Zhou, Mo and Niu, Zhenxing and Wang, Le and Gao, Zhanning and Zhang, Qilin and Hua, Gang},
@@ -34,7 +34,7 @@ BibTex:
 
 In case if you want to cite the preprint version:
 
-```latex
+```bib
 @article{zhou2019ladderloss,
   title={Ladder Loss for Coherent Visual-Semantic Embedding},
   author={Zhou, Mo and Niu, Zhenxing and Wang, Le and Gao, Zhanning and Zhang, Qilin and Hua, Gang},
