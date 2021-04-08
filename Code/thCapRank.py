@@ -59,11 +59,33 @@ def featstat(feat):
         f'max {feat.max().item():.5f}'  ])
 
 
-def adjustLearningRate(optim, lr0, eph, giter) -> float:
+def adjustLearningRate(optim, lr0: float, eph: int,
+        giter, liter=None, cycle=None, *, method='step') -> float:
     '''
-    Adjust the learning rate of the given optimizer. Method: step
+    Adjust the learning rate of the given optimizer.
+
+    optim: pytorch optimizer
+    lr0: initial learning rate (for the very beginning)
+    eph: current epoch [0,..)
+    giter: global (accumulate) iterations from the very beginning
+    liter: current iteration from this epoch
     '''
-    lr = lr0 * (0.1 ** (eph // 15))
+    if method == 'step':
+        lr = lr0 * (0.1 ** (eph // 15))
+    elif method == 'cyclical':
+        sign = (-1)**eph
+        if sign > 0:
+            lr = (lr0 * 0.1) + liter * 0.9 * lr0 / cycle
+        else:
+            lr = lr0 - liter * 0.9 * lr0 / cycle
+    elif method == '1cycle':
+        if eph < 15:
+            lr = (lr0 * 0.1) + (giter * 0.9 * lr0) / (15 * cycle)
+        elif eph >= 15:
+            lr = lr0 - (giter - 15 * cycle) * 0.9 * lr0 / (15 * cycle)
+    else:
+        raise ValueError('unknown learning rate scheduling method')
+    # apply to the given optimizer
     for param_group in optim.param_groups:
         param_group['lr'] = lr
     return lr
@@ -97,7 +119,7 @@ class PairwiseRankingLoss(th.nn.Module):
 
 
 
-def getRecall(scores: np.ndarray, ks: List[int] = (1,5,10,50)):
+def getRecall(scores: np.ndarray, ks: List[int] = (1, 5, 10)):
     '''
     caculate the recall value
     '''
@@ -120,7 +142,7 @@ def getRecall(scores: np.ndarray, ks: List[int] = (1,5,10,50)):
     return recalls, recall_score, recall_raw
 
 
-def calcRecall(scores: np.ndarray, ks: List[int] = (1,5,10,50)):
+def calcRecall(scores: np.ndarray, ks: List[int] = (1, 5, 10)):
     '''
     Simpler implementation of Recall calculator for retrieval.
     '''
@@ -136,7 +158,7 @@ def calcRecall(scores: np.ndarray, ks: List[int] = (1,5,10,50)):
     print()
 
 
-def getRecallDup5(scores: np.ndarray, ks: List[int] = (1,5,10,50)):
+def getRecallDup5(scores: np.ndarray, ks: List[int] = (1, 5, 10)):
     '''
     caculate the special recall value, where the rows of score matrix is
     duplicated by five times. This is very stupid.
@@ -212,7 +234,7 @@ class F30kRawDataset(CocoPreproDataset):
     '''
     Used for fine-tuning
     '''
-    def __init__(self, poolpath, tokspkl, jsonpath='/niuz/dataset/flickr30k/dataset.json'):
+    def __init__(self, poolpath, tokspkl, jsonpath=os.path.expanduser('~/dataset_flickr30k.json')):
         self.lingual = lingual.CocoLtokDataset(tokspkl)
         self.visual = visual.F30kVRawDataset(jsonpath, poolpath)
         random.shuffle(self.lingual.sentids)
@@ -285,11 +307,17 @@ class JointEmbNet(th.nn.Module):
 
 def evaluation(valset, model, snapshot=False,
         *, best=[0.], tbx = False, giter = 0, save_checkpoint = True,
-        finetune=False):
+        finetune=False, eval5k=False):
     print('\x1b[48;5;93m>> VALIDATION @', giter, '|', 'save_checkpoint=', save_checkpoint, '\x1b[m')
+    if eval5k:
+        print('XXX: special mode: eval5k')
+
     # need another loader in fine-tuning mode
-    if finetune: val_loader = visual.CocoVRawDataset('../coco/annotations/', '/dev/shm/COCO', croptype='TenCrop')
-    #if finetune: val_loader = visual.F30kVRawDataset('../flickr30k/dataset.json', '/dev/shm/flickr30k-images/', croptype='TenCrop')
+    if finetune:
+        if int(os.getenv('F30K', 0)) > 0:
+            val_loader = visual.F30kVRawDataset(os.path.expanduser('~/dataset_flickr30k.json'), '/dev/shm/flickr30k-images/', croptype='TenCrop')
+        else:
+            val_loader = visual.CocoVRawDataset('annotations/', os.path.expanduser('~/COCO'), croptype='TenCrop')
 
     cnnfeats, rnnfeats = [], []
     model.eval()
@@ -302,14 +330,19 @@ def evaluation(valset, model, snapshot=False,
 
             cnnfeats.append(xs.detach())
             rnnfeats.append(vs.detach())
-            if len(cnnfeats) >= 5000: break
+            if len(cnnfeats) >= 5000 and (not eval5k): break
         else:
             if iteration % 5 == 0:
                 xs = val_loader.byiid(int(iid))
                 xs = xs.unsqueeze(0).cuda() if val_loader.croptype=='CenterCrop' else xs.cuda()
                 # Forwarding merely 1 sample in DataParallel mode is much much slower than single card mode.
                 # xs = finetune(xs).mean(0).unsqueeze(0)
-                xs = finetune.module(xs).mean(0).unsqueeze(0)
+                if hasattr(finetune, 'module'):
+                    # This is a data parallel model
+                    xs = finetune.module(xs).mean(0).unsqueeze(0)
+                else:
+                    # this is not data parallel model
+                    xs = finetune(xs).mean(0).unsqueeze(0)
                 xs = th.nn.functional.normalize(xs, dim=1)
                 xs = model.forwardVisualPre(xs)
                 #xs, vs = model(xs, [vs], [iid], [sid])
@@ -318,8 +351,7 @@ def evaluation(valset, model, snapshot=False,
                 cnnfeats.append(cnnfeats[-1])
             vs = model.forwardLingual([vs])
             rnnfeats.append(vs.detach())
-            if len(cnnfeats) >= 5000: break
-
+            if len(cnnfeats) >= 5000 and not (eval5k): break
 
     cnnfeats, rnnfeats = th.cat(cnnfeats), th.stack(rnnfeats)
     print(' * Validation set shape', cnnfeats.shape, rnnfeats.shape)
@@ -348,6 +380,13 @@ def evaluation(valset, model, snapshot=False,
         tbx.add_scalar('validate/recallT.1',    ptTraw[2][1], giter)
         tbx.add_scalar('validate/recallT.5',    ptTraw[3][1], giter)
         tbx.add_scalar('validate/recallT.10',   ptTraw[4][1], giter)
+
+    if eval5k:
+        print('dumping features')
+        th.save([cnnfeats.detach().cpu(), rnnfeats.detach().cpu()],
+            os.path.join(os.path.dirname(snapshot), f'feat_eval5k.pth'))
+        print('finished eval5k')
+        exit(0)
 
     # save the model
     if snapshot:
@@ -396,6 +435,10 @@ def datasetSplit(dataset, split_info:str = ''):
         return trainset, valset, testset, split_info
     valsize = 5000  # 5k images <-> 25k sentences
     tstsize = 5000  # 5k images <-> 25k sentences
+    if len(dataset) < 155100:
+        print('DATASET SPLIT: detected f30k')
+        valsize = 1000
+        tstsize = 1000
     trainidxs, validxs, testidxs = list(), list(), list()
     # assign images for val set and test set
     valiids, testiids = set(), set()
@@ -490,6 +533,7 @@ def mainTrain(argv):
     ag.add_argument('--report', type=int, default=100, help='report interval')
     ag.add_argument('--seed', type=int, default=1024)
     ag.add_argument('--cocopool', type=str, default='')
+    ag.add_argument('--eval5k', action='store_true', help='evaluate the model with 5k val')
     ag = ag.parse_args(argv)
     ag.device = th.device(ag.device)
     if ag.config:
@@ -523,8 +567,10 @@ def mainTrain(argv):
     if not ag.finetune:
         cocodataset = CocoPreproDataset(ag.cnnpkl, ag.tokspkl)
     else:
-        cocodataset = CocoRawDataset(ag.cocopool, ag.tokspkl)
-        #cocodataset = F30kRawDataset(ag.cocopool, ag.tokspkl)
+        if int(os.getenv('F30K', 0)) > 0:
+            cocodataset = F30kRawDataset(ag.cocopool, ag.tokspkl)
+        else:
+            cocodataset = CocoRawDataset(ag.cocopool, ag.tokspkl)
     trainset, valset, testset, splitinfo = datasetSplit(cocodataset, ag.split)
     spk.jsonSave(splitinfo, ag.logdir + '/split_info.json')
     print('  - training set size', len(trainset), 'val set size', len(valset))
@@ -605,11 +651,11 @@ def mainTrain(argv):
             if giter%ag.testevery == 0:
                 evaluation(valset, model,
                            os.path.join(ag.logdir, f'snapshot_latest.pth'),
-                           tbx=tbx, giter=giter, save_checkpoint=True, finetune=ag.finetune)
+                           tbx=tbx, giter=giter, save_checkpoint=True, finetune=ag.finetune, eval5k=ag.eval5k)
 
             model.train()
             if ag.finetune: ag.finetune.train()
-            lr = -1 if ag.finetune else adjustLearningRate(optim, ag.lr, epoch, giter)
+            lr = -1 if ag.finetune else adjustLearningRate(optim, ag.lr, epoch, giter, iteration, len(trainloader))
 
             # [forward]
             if ag.finetune != '':
@@ -850,108 +896,5 @@ Fine-Tuning CNN on Flickr30K dataset
 2. Start fine-tuning. Note, don't change the dataset split!
 >>> python3 thCapRank.py Train -D cuda:0 -L junk/f30kres18.ft --finetune Resnet18 --cnndim 512 \
 ...   --tokspkl lingual.py.f30k.toks --snapshot junk/f30kres18/snapshot_latest.pth \
-...   -S junk/f30kres18/split_info.json --cocopool /niuz/dataset/flickr30k-images --maxepoch 15
-
-Performance Table on MSCOCO
-===========================
-------
-ResNet-18, 1000 images and 5000 sentences,  no fine-tune, 592.3 (March. 15 2019)
-| 1000 vs 1000:
- 'r@mean   9.9,  r@med   2.0,  r@1  39.7,  r@5  74.4,  r@10  85.5,  r@50  97.1',
- 'r@mean  10.5,  r@med   2.0,  r@1  39.2,  r@5  73.9,  r@10  85.3,  r@50  97.2']
-| 1000 vs 5000:
-r@mean   4.5    r@med   1.0     r@1  53.3       r@5  83.3       r@10  91.7      r@50  99.2
-r@mean  10.7    r@med   2.0     r@1  39.3       r@5  73.4       r@10  84.4      r@50  96.7
-------
-ResNet-18, 1000  images and 5000 sentences, fine-tune, 628.2 (March. 19 2019)
-| 1000 vs 1000:
- 'r@mean   8.7,  r@med   2.0,  r@1  44.8,  r@5  81.3,  r@10  90.5,  r@50  97.6',
- 'r@mean   8.6,  r@med   2.0,  r@1  46.0,  r@5  80.0,  r@10  90.1,  r@50  97.9']
-| 1000 vs 5000:
-r@mean   3.1    r@med   1.0     r@1  61.1       r@5  89.1       r@10  95.1      r@50  99.6
-r@mean   7.9    r@med   2.0     r@1  46.2       r@5  79.4       r@10  89.2      r@50  97.9
-------
-ResNet-34, no fine-tune, score 613.2 (June 13 2019)
-| 1000 vs 1000:
- * Recall(x->v): r@mean   8.9,  r@med   2.0,  r@1  44.3,  r@5  78.3,  r@10  88.5,  r@50  97.5
- * Recall(v->x): r@mean   9.0,  r@med   2.0,  r@1  40.3,  r@5  77.7,  r@10  88.8,  r@50  97.8
-| 1000 vs 5000:
-r@mean   3.5    r@med   1.0     r@1  55.4       r@5  85.6       r@10  93.3      r@50  99.6
-r@mean   9.6    r@med   2.0     r@1  41.3       r@5  76.4       r@10  87.1      r@50  97.5
-------
-ResNet-50, no fine-tune, score 630.8 (June. 13 2019)
-| 1000 vs 1000:
- * Recall(x->v): r@mean   7.6,  r@med   2.0,  r@1  48.0,  r@5  80.8,  r@10  89.4,  r@50  98.0
- * Recall(v->x): r@mean   7.7,  r@med   2.0,  r@1  46.7,  r@5  80.6,  r@10  89.3,  r@50  98.0
-| 1000 vs 5000:
-r@mean   3.1    r@med   1.0     r@1  61.1       r@5  88.5       r@10  94.9      r@50  99.6
-r@mean   8.1    r@med   2.0     r@1  45.5       r@5  79.2       r@10  89.1      r@50  97.8
-------
-ResNet-101, no fine-tune, score 631.6 (June. 13 2019)
-| 1000 vs 1000:
- * Recall(x->v): r@mean   7.0,  r@med   2.0,  r@1  46.6,  r@5  81.0,  r@10  90.9,  r@50  98.2
- * Recall(v->x): r@mean   7.2,  r@med   2.0,  r@1  46.4,  r@5  79.6,  r@10  90.8,  r@50  98.1
-| 1000 vs 5000:
-r@mean   3.1    r@med   1.0     r@1  62.4       r@5  88.6       r@10  94.8      r@50  99.7
-r@mean   7.4    r@med   2.0     r@1  46.2       r@5  79.8       r@10  89.7      r@50  97.9
-------
-ResNet-152, 1000 images and 5000 sentences, no fine-tune (baseline), 639.7(March. 15 2019)
-| 1000 vs 1000:
- 'r@mean   6.5,  r@med   2.0,  r@1  49.6,  r@5  83.1,  r@10  91.0,  r@50  98.2',
- 'r@mean   7.0,  r@med   2.0,  r@1  47.0,  r@5  81.2,  r@10  91.4,  r@50  98.2']
-| 1000 vs 5000:
-r@mean   2.8	r@med   1.0	r@1  63.2	r@5  88.9	r@10  95.5	r@50  99.9
-r@mean   7.3	r@med   2.0	r@1  47.4	r@5  80.3	r@10  89.9	r@50  98.0
-------
-EfficientNet-B0, no fine-tune, 617.1 (June. 5 2019)
-| 1000 vs 1000:
- * Recall(x->v): r@mean   7.5,  r@med   2.0,  r@1  43.1,  r@5  79.9,  r@10  89.1,  r@50  98.0
- * Recall(v->x): r@mean   7.9,  r@med   2.0,  r@1  41.2,  r@5  78.5,  r@10  89.4,  r@50  97.9
-| 1000 vs 5000:
-r@mean   3.6    r@med   1.0     r@1  54.3       r@5  85.2       r@10  93.5      r@50  99.4
-r@mean   9.1    r@med   2.0     r@1  41.9       r@5  77.5       r@10  88.0      r@50  97.4
-------
-EfficientNet-B1, no fine-tune, 620.4 (June. 10 2019)
-| 1000 vs 1000:
- * Recall(x->v): r@mean   7.0,  r@med   2.0,  r@1  43.0,  r@5  81.1,  r@10  90.3,  r@50  97.7
- * Recall(v->x): r@mean   7.1,  r@med   2.0,  r@1  41.5,  r@5  79.5,  r@10  89.5,  r@50  97.8
-| 1000 vs 5000:
-r@mean   3.6    r@med   1.0     r@1  55.3       r@5  87.2       r@10  95.0      r@50  99.7
-r@mean   9.2    r@med   2.0     r@1  41.6       r@5  78.2       r@10  87.9      r@50  97.2
-------
-EfficientNet-B2, no fine-tune, 612.0 (June. 12 2019)
-| 1000 vs 1000:
- * Recall(x->v): r@mean   8.2,  r@med   2.0,  r@1  42.7,  r@5  79.1,  r@10  89.2,  r@50  97.7
- * Recall(v->x): r@mean   8.6,  r@med   2.0,  r@1  39.8,  r@5  77.5,  r@10  88.2,  r@50  97.8
-| 1000 vs 5000:
-r@mean   4.3    r@med   1.0     r@1  53.2       r@5  84.6       r@10  93.2      r@50  99.3
-r@mean   9.3    r@med   2.0     r@1  40.6       r@5  76.7       r@10  87.7      r@50  97.4
-------
-EfficientNet-B3, no fine-tune, 602.3 (June. 8, 2019)
-| 1000 vs 1000:
- * Recall(x->v): r@mean   8.2,  r@med   2.0,  r@1  40.3,  r@5  76.9,  r@10  88.3,  r@50  97.4
- * Recall(v->x): r@mean   8.3,  r@med   2.0,  r@1  38.0,  r@5  75.6,  r@10  88.5,  r@50  97.3
-| 1000 vs 5000:
-r@mean   4.5    r@med   1.0     r@1  52.7       r@5  83.5       r@10  91.9      r@50  99.0
-r@mean  10.4    r@med   2.0     r@1  39.1       r@5  75.7       r@10  87.4      r@50  97.1
-
-Performance Table on Flickr30K
-==============================
-<<<<<<
-Resnet-18, 1000 images and 5000 sentences, no fine-tune, 472.2 (March. 15 2019)
-| 1000 vs 1000:
- 'r@mean  28.5,  r@med   4.0,  r@1  28.5,  r@5  55.2,  r@10  67.4,  r@50  85.0',
- 'r@mean  29.0,  r@med   4.0,  r@1  26.7,  r@5  56.8,  r@10  67.3,  r@50  85.3']
-| 1000 vs 5000:
-r@mean  20.1    r@med   3.0     r@1  36.6       r@5  65.8       r@10  76.8      r@50  92.3
-r@mean  27.8    r@med   4.0     r@1  26.6       r@5  55.1       r@10  67.0      r@50  87.2
-------
-Resnet-18, 1000 images and 5000 sentences, after fine-tune, 504.3 (March. 15 2019)
-| 1000 vs 1000:
- 'r@mean  27.9,  r@med   3.0,  r@1  31.3,  r@5  61.6,  r@10  70.4,  r@50  87.9',
- 'r@mean  28.7,  r@med   3.0,  r@1  33.8,  r@5  61.7,  r@10  70.8,  r@50  86.8']
-| 1000 vs 5000:
-r@mean  15.9    r@med   2.0     r@1  45.7       r@5  74.5       r@10  81.4      r@50  93.7
-r@mean  26.5    r@med   3.0     r@1  32.5       r@5  60.4       r@10  70.9      r@50  88.5
->>>>>>
+...   -S junk/f30kres18/split_info.json --cocopool /dev/shm/flickr30k-images --maxepoch 15
 '''

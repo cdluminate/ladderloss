@@ -18,6 +18,7 @@ limitations under the License.
 '''
 from typing import *
 import torch as th
+import torch.nn.functional as F
 import os, sys, json, re
 import pickle
 import random
@@ -70,6 +71,7 @@ class SpacySimMat(object):
                  valpath='annotations/captions_val2014.json',
                  lang_model='en_core_web_lg',
                  cache=f'{__file__}.SpacySimMat.cache',
+                 diagone=False,
                  verbose=True):
 
         jtrn = json.load(open(trnpath, 'r'))
@@ -98,9 +100,15 @@ class SpacySimMat(object):
                 self.vectors[int(sid)] = nrmed
             pickle.dump(self.vectors, open(cache, 'wb'))
 
+        # special options
+        self.diagone = diagone
+
     def __call__(self, sids):
         vecs = np.stack([self.vectors[int(sid)] for sid in sids], axis=0)
         mat = vecs @ vecs.T
+        if self.diagone:
+            np.fill_diagonal(mat, 1.0)
+            return mat
         return mat
 
     def __getitem__(self, indeces):
@@ -308,7 +316,7 @@ class F30kCaption(object):
     '''
     fetch raw sentences from f30k dataset
     '''
-    def __init__(self, jsonpath='/niuz/dataset/flickr30k/dataset.json'):
+    def __init__(self, jsonpath=os.path.expanduser('~/dataset_flickr30k.json')):
         all_json = json.load(open(jsonpath, 'r'))
         self.annotations, self.sid2iid, self.iid2fname = {}, {}, {}
         for i, image in enumerate(all_json['images']):
@@ -690,6 +698,15 @@ class LadderLoss(th.nn.Module):
 
         return sum(losses)
 
+    def accessoryRegression(self, xs, vs, iids, sids):
+        '''
+        [optional] Appending a regression loss.
+        '''
+        rdmat = th.tensor(self.rd(sids)).float().to(xs.device)
+        xvs = F.cosine_similarity(xs[:,:,None], vs.T[None,:,:])
+        loss = ((xvs - rdmat)**2).mean()
+        return loss
+
     def accessorybinCls(self, xs, vs, iids, sids):
         '''
         Accessory: aid VSE training with classification loss
@@ -715,32 +732,11 @@ class AutoThreshLadderLoss(th.nn.Module):
     reldeg: relevance degree metric, it must have a __getitem__ method.
             when reldeg is not provided, ladder loss falls back to pwl.
             possible RDs: BowSim, EcoSTSMatrix, CoMatrix (IoU mode)
-
-    >>> ath1p margin[0.2 0.01] pctl[90] betas[.25] cbow pedantic=True
-        PENDING
-    >>> ath8 margin[0.2 0.01] pctl[96] betas[.25] cbow
-        .259 .246 ; .286 .204 ; 624.4
-    >>> ath7 margin[0.2 0.01] pctl[25] betas[.25] cbow
-        .268 .272 ; .326 .201 ; 636.8
-    >>> ath6 margin[0.2 0.01] pctl[10] betas[.25] cbow
-        .264 .261 ; .360 .230 ; Recall@TOTAL 636.2
-    >>> ath5 margin[0.2 0.01] pctl[60] betas[.25] cbow
-        .269 .271 ; .287 .178 ;              631.9
-    >>> {SAN} ath4 margin[0.2 0.01] pctl[90] betas[0] cbow
-        .248 .244 ; .079 .087 ;              635.7
-    >>> ath3 margin[0.2 0.1] pctl[90] betas[0.25] cbow
-        .254 .250 ; .290 .197 ;              625.6
-    >>> coco-autothresh9-2 margin[0.2,0.01],pctl[90],betas[0.25],spacysimmat:
-        .250 .251 ; .287 .197 ; Recall@TOTAL 625.6
-    >>> coco-autothresh5-2 margin[0.2,0.01],pctl[50],betas[0.25],spacysimmat:
-        .270 .272 ; .297 .180 ; Recall@TOTAL 633.2
-    >>> reference (CVSE++, no FT, Res152)
-        .265 .256 ; .358 .236 ; Recall@TOTAL > 630
     '''
 
     def __init__(self, margins=[0.2], *,
             percentiles=[], betas=[], reldeg=None,
-            debug=False, pedantic=False):
+            debug=False):
         '''
         Instantiate LadderLoss function.
         Note that you can adjust self.hard_negative to enable or disable
@@ -761,7 +757,6 @@ class AutoThreshLadderLoss(th.nn.Module):
             raise ValueError("RelDeg metric is required if set any threshold")
         self.percentiles = percentiles
         self.debug = debug
-        self.pedantic = pedantic # WARNING: use with care
 
     def forward(self, xs, vs, iids, sids):
         '''
@@ -797,49 +792,26 @@ class AutoThreshLadderLoss(th.nn.Module):
         if self.debug:
             print('LadderLoss>', 'sum(STSmat)=', rdmat.sum())
 
-        # [[ PEDANTIC MODE ]] AutoThreshLadderLoss
-        if self.pedantic:
-            clsxv = th.from_numpy(BatchedAutoThresh(rdmat_raw, self.percentiles)
-                    ).float().to(device)
-            clsvx = th.from_numpy(BatchedAutoThresh(rdmat_raw.T, self.percentiles)
-                    ).float().to(device).t()
-            for (i, pctl) in enumerate(self.percentiles):
-                # x -> v
-                simmaskxv, dismaskxv = (clsxv == i).float(), (clsxv != i).float()
-                simscorexv = scores * simmaskxv + 1e10 * dismaskxv
-                disscorexv = scores * dismaskxv
-                xvld = (self.margins[i+1] - simscorexv.min(dim=1)[0]
-                        + disscorexv.max(dim=1)[0]).clamp(min=0.)
-                # v -> x
-                simmaskvx, dismaskvx = (clsvx == i).float(), (clsvx != i).float()
-                simscorevx = scores * simmaskvx + 1e10 * dismaskvx
-                disscorevx = scores * dismaskvx
-                vxld = (self.margins[i+1] - simscorevx.min(dim=0)[0]
-                        + disscorevx.max(dim=0)[0]).clamp(min=0.)
-                # sum
-                losses.append(self.betas[i] * (xvld.sum() + vxld.sum()))
-            return sum(losses)
-
         # AutoThreshLadderLoss
-        clsxv = th.from_numpy(BatchedAutoThresh(rdmat_raw, self.percentiles)
-                ).float().to(device)
-        clsvx = th.from_numpy(BatchedAutoThresh(rdmat_raw.T, self.percentiles)
-                ).float().to(device).t()
-        for (i, pctl) in enumerate(self.percentiles):
+        clsxv = th.from_numpy(BatchedAutoThresh(rdmat_raw, self.percentiles,
+                preserve_zero=True)).float().to(device)
+        clsvx = th.from_numpy(BatchedAutoThresh(rdmat_raw.T, self.percentiles,
+                preserve_zero=True)).float().to(device).t()
+        for (i, pctl) in enumerate(self.percentiles, 1):
             # x -> v
             simmaskxv, dismaskxv = (clsxv <= i).float(), (clsxv > i).float()
             simscorexv = scores * simmaskxv + 1.0 * dismaskxv
             disscorexv = scores * dismaskxv
-            xvld = (self.margins[i+1] - simscorexv.min(dim=1)[0]
+            xvld = (self.margins[i] - simscorexv.min(dim=1)[0]
                     + disscorexv.max(dim=1)[0]).clamp(min=0.)
             # v -> x
             simmaskvx, dismaskvx = (clsvx <= i).float(), (clsvx > i).float()
             simscorevx = scores * simmaskvx + 1.0 * dismaskvx
             disscorevx = scores * dismaskvx
-            vxld = (self.margins[i+1] - simscorevx.min(dim=0)[0]
+            vxld = (self.margins[i] - simscorevx.min(dim=0)[0]
                     + disscorevx.max(dim=0)[0]).clamp(min=0.)
             # sum
-            losses.append(self.betas[i] * (xvld.sum() + vxld.sum()))
+            losses.append(self.betas[i-1] * (xvld.sum() + vxld.sum()))
 
         return sum(losses)
 
@@ -849,18 +821,12 @@ class AutoKmeansLadderLoss(th.nn.Module):
     Dynamic Ladder Loss Function for Coherent Visual Semantic Embedding Learning
     The distance metric is cosine distance.
 
-    N.B. This is the adaptive version of ladder loss for the T-PAMI submission.
+    N.B. This is the adaptive version of ladder loss for the journal submission.
         -- Mar 2020. M.Zhou
 
     reldeg: relevance degree metric, it must have a __getitem__ method.
             when reldeg is not provided, ladder loss falls back to pwl.
             possible RDs: BowSim, EcoSTSMatrix, CoMatrix (IoU mode)
-    >>> {SAN} bounds=[2,2] with 0 beta (degenerates to pure triplet)
-        .248 .244 ; .079 .087 ; 635.7
-    >>> bounds=[2,2]
-        .256 .196 ; .256 .123 ; Recall@TOTAL 452.2
-    >>> reference (CVSE++, no FT, Res152)
-        .265 .256 ; .358 .236 ; Recall@TOTAL > 630
     '''
     def __init__(self, bounds=None, *, reldeg=None, debug=False):
         '''
@@ -869,19 +835,18 @@ class AutoKmeansLadderLoss(th.nn.Module):
         super(AutoKmeansLadderLoss, self).__init__()
         if bounds is None:
             raise ValueError("Missing bounds for automatic clustering, e.g. [2,5]")
+        # when lowerbound = 1, this function degenerates into triplet
+        assert(bounds[0] >= 1)
+        # the max upperbound is 8
+        assert(bounds[1] <= 8)
         self.bounds = bounds
         self.rd = reldeg
-        self.margins = [0.2,
-                0.01, 0.01, 0.01, 0.01,
-                0.01, 0.01, 0.01, 0.01,
-                0.01, 0.01, 0.01, 0.01]
+        self.margins = [0.2, *[0.01 for _ in range(0,8)]]
         if len(self.margins) > 1 and (reldeg is None):
             raise ValueError("Missing RelDeg.")
         self.debug = debug
-        self.betas = [1.0,
-                1./4, 1./8, 1./16, 1./32,
-                1./64, 1./64, 1./64, 1./64,
-                1./64, 1./64, 1./64, 1./64]
+        self.betas = [1.0, *[1./(2**(2+i)) for i in range(0,8)]]
+        assert(len(self.margins) == len(self.betas))
 
     def forward(self, xs, vs, iids, sids):
         '''
@@ -916,26 +881,27 @@ class AutoKmeansLadderLoss(th.nn.Module):
             print('LadderLoss>', 'sum(STSmat)=', rdmat.sum())
         # assemble the cluster label matrix for adaptive ladder
         rd_cpu = rdmat.detach().cpu().numpy()
-        clmatrix_xv = th.from_numpy(BatchedAutoKmeans(rdmat_raw, self.bounds)
-                ).float().to(device)
-        clmatrix_vx = th.from_numpy(BatchedAutoKmeans(rdmat_raw.T, self.bounds)
-                ).float().to(device).t()
+        clmatrix_xv = th.from_numpy(BatchedAutoKmeans(rdmat_raw, self.bounds,
+                preserve_zero=True)).float().to(device)
+        clmatrix_vx = th.from_numpy(BatchedAutoKmeans(rdmat_raw.T, self.bounds,
+                preserve_zero=True)).float().to(device).t()
         # calculate adaptive ladder loss
         for l in range(1, np.max(self.bounds)):
             # prevlad 0 has been processed in step 1
             # x->v direction
             simmask_xv = (clmatrix_xv <= l).float().to(device)
             dismask_xv = (clmatrix_xv > l).float().to(device)
-            sc_sim_xv = scores * simmask_xv + 1.0 * dismask_xv # 1.0 is ubound of cos(.)
+            sc_sim_xv = scores * simmask_xv + 1.1 * dismask_xv # 1.0 is ubound of cos(.)
             sc_dis_xv = scores * dismask_xv
             xvld = self.margins[l] - sc_sim_xv.min(dim=1)[0] + sc_dis_xv.max(dim=1)[0]
             xvld = xvld.clamp(min=0.)
             # v-> x direction
             simmask_vx = (clmatrix_vx <= l).float().to(device)
             dismask_vx = (clmatrix_vx > l).float().to(device)
-            sc_sim_vx = scores * simmask_vx + 1.0 * dismask_vx
+            sc_sim_vx = scores * simmask_vx + 1.1 * dismask_vx
             sc_dis_vx = scores * dismask_vx
             vxld = self.margins[l] - sc_sim_vx.min(dim=0)[0] + sc_dis_vx.max(dim=0)[0]
+            vxld = vxld.clamp(min=0.)
             # aggregate
             losses.append(self.betas[l] * (xvld.sum() + vxld.sum()))
 
@@ -975,7 +941,7 @@ def calcRecall(scores: np.ndarray, ks: List[int] = (1, 5, 10)):
     print()
 
 
-def getRecallDup5(scores: np.ndarray, ks: List[int] = (1, 5, 10, 50)):
+def getRecallDup5(scores: np.ndarray, ks: List[int] = (1, 5, 10)):
     '''
     caculate the special recall value, where the rows of score matrix is
     duplicated by five times. This is very stupid.
@@ -1012,6 +978,36 @@ def getRecallDup5(scores: np.ndarray, ks: List[int] = (1, 5, 10, 50)):
     rT_ks = [(f'r@{k}', f'{r:>5.1f}') for (k, r) in rT_ks]
     rT_ks = '\t'.join(' '.join(t) for t in rT_ks)
     return r_ks + rT_ks
+
+
+def calcismapdup5(scores: np.ndarray):
+    '''
+    images 5000 (1000 dup5) * 5000 sentences
+    '''
+    assert (len(scores.shape) == 2)
+    scores = scores[::5, :]
+    nimages, ncaptions = scores.shape
+    print('* Special mAP with', nimages, 'images and', ncaptions,
+          'captions')
+    # fake label
+    labels = (np.arange(scores.shape[1])/5.).astype(int)
+    def _ap_(dists: np.ndarray, labels: np.ndarray, label: int):
+        assert(len(dists.shape) == 1 and len(labels.shape) == 1)
+        assert(len(dists) == len(labels))
+        argsort = dists.argsort()[::-1][1:]
+        argwhere1 = np.where(labels[argsort] == label)[0] + 1
+        ap = ((np.arange(len(argwhere1)) + 1) / argwhere1).mean()
+        return ap
+    AP = [_ap_(scores[i,:], labels, i) for i in range(scores.shape[0])]
+    mAP = np.mean(AP)
+    print('mAP=', mAP)
+
+
+def __mapsanity():
+    scores = np.zeros((5000, 5000))
+    for i in range(0, 5000, 5):
+        scores[i:i+5,i:i+5] = 1.
+    calcismapdup5(scores)
 
 
 def calcTauK(scores: np.ndarray,
@@ -1056,6 +1052,8 @@ def doRecall(argv):
         calcRecall(scores.T)
     else:
         print(getRecallDup5(scores))
+        #__mapsanity()
+        calcismapdup5(scores)
 
 
 def doVis(argv):
@@ -1146,7 +1144,7 @@ def doTau(argv):
     ag.add_argument('-R', '--reps', type=str, required=False)
     ag.add_argument('-S', '--split', type=str, required=False)
     ag.add_argument('-M', '--sts', type=str, required=False,
-            choices=['cbow', 'bert'], default='cbow')
+            choices=['cbow', 'bert', 'sbert'], default='cbow')
     ag.add_argument('--valsize', type=int, default=5000)
     ag.add_argument('--dataset', type=str, default='COCO', choices=('COCO', 'F30K'))
     ag = ag.parse_args(argv)
@@ -1158,7 +1156,9 @@ def doTau(argv):
     if (not ag.reps) or (not ag.split):
         raise ValueError("either reps or split is missing from cmdline")
 
-    ks = [50, 100, 200, 500, 1000]
+    ks = [100, 200, 1000]
+    if ag.valsize > 5000 or ag.valsize < 0:
+        ks = [500, 5000]
 
     # load dataset split and get sids of the validation set
     split = json.load(open(ag.split, 'r'))
@@ -1191,6 +1191,56 @@ def doTau(argv):
         print('Parsing and tokenizing sentences ...')
         captions = np.vstack([_wcbow_(nlp(x)) for x in tqdm(captions)])
         capsts = captions @ captions.T
+
+        N = scores.shape[0]
+        for K in ks:
+            tau_itos, tau_stoi = np.zeros(N), np.zeros(N)
+            spr_itos, spr_stoi = np.zeros(N), np.zeros(N)
+            sts_itos, sts_stoi = np.zeros((N, K)), np.zeros((N, K))
+            for i in range(N):
+                # image to sentence: top K
+                idxs = np.argsort(scores[i])[::-1][:K]
+                sts = capsts[i, idxs]
+                sts_itos[i, :] = sts
+                tau, _ = kendalltau(scores[i][idxs], sts)
+                spr, _ = spearmanr(scores[i][idxs], sts)
+                tau_itos[i] = tau
+                spr_itos[i] = spr
+                # sentence to image: top K
+                idxs = np.argsort(scores.T[i])[::-1][:K]
+                sts = capsts[i, idxs]
+                sts_stoi[i, :] = sts
+                tau, _ = kendalltau(scores.T[i][idxs], sts)
+                spr, _ = spearmanr(scores.T[i][idxs], sts)
+                tau_stoi[i] = tau
+                spr_stoi[i] = spr
+            print(f'Tau@{K:4d}:', '%.3f' % tau_itos.mean(),
+                  '%.3f' % tau_stoi.mean(), end='\t')
+            print(f'Spr@{K:4d}:', '%.3f' % spr_itos.mean(),
+                  '%.3f' % spr_stoi.mean())
+            #print('STS::i->s histogram')
+            #x, y = np.histogram(sts_itos)
+            #print(x)
+            #print(y)
+            #print('STS::s->i histogram')
+            #x, y = np.histogram(sts_stoi)
+            #print(x)
+            #print(y)
+    elif ag.sts == 'sbert':
+        if ag.dataset == 'COCO':
+            captions = CocoCaption()[sids]
+        else:
+            captions = F30kCaption()[sids]
+        from tqdm import tqdm
+        # Load the pretrained model
+        from sentence_transformers import SentenceTransformer
+        clmodel = 'paraphrase-distilroberta-base-v1'
+        model = SentenceTransformer(clmodel)
+        print('Parsing and tokenizing sentences ...')
+        # calculate and store
+        embs = np.stack([model.encode(i) for i in captions])
+        embs = embs / np.linalg.norm(embs, axis=1).reshape(-1,1)
+        capsts = embs @ embs.T
 
         N = scores.shape[0]
         for K in ks:

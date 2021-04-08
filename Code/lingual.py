@@ -136,7 +136,7 @@ def mainPrepare(argv):
     pprint(vars(ag))
 
     if ag.DATASET == 'F30K':
-        f = open('/luminz/Datasets/flickr30k/dataset.json', 'r')
+        f = open(os.path.expanduser('~/dataset_flickr30k.json'), 'r')
         alltokens, trainvocab = f30kTokenize(f)
         spk.jsonSave([alltokens, trainvocab], ag.save)
         print('tokenization result written to', ag.save)

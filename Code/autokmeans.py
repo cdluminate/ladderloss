@@ -23,20 +23,49 @@ from sklearn.cluster import k_means
 from sklearn.metrics import silhouette_score
 from multiprocessing import cpu_count
 #from multiprocessing.dummy import Pool
-from joblib import Parallel, delayed
+#from joblib import Parallel, delayed
 import time
+import faiss
+faiss.omp_set_num_threads(1)
 
 
-def kmeans_trial(data, nc: int) -> tuple:
+def kmeans_trial(data: np.ndarray, nc: int) -> tuple:
     '''
     number of clusters -> (labels, silhouette coef)
     '''
-    centroids, labels, _ = k_means(data, nc)
+    # [slow, sklearn]
+    #centroids, labels, _ = k_means(data, nc)
+    # [fast, faiss]
+    npvecs = data.astype('float32')
+    ncls = nc
+
+    # [use cuda]
+    #gpu_resource = faiss.StandardGpuResources()
+    #cluster_idx = faiss.IndexFlatL2(npvecs.shape[1])
+    #cluster_idx = faiss.index_cpu_to_gpu(gpu_resource, 0, cluster_idx)
+    #kmeans = faiss.Clustering(npvecs.shape[1], ncls)
+    #kmeans.verbose = False
+    #kmeans.train(npvecs, cluster_idx)
+    #_, pred = cluster_idx.search(npvecs, 1)
+    #pred = pred.flatten()
+    #labels = pred
+    #centroids = np.array([kmeans.centroids.at(i) for i in
+    #    range(kmeans.centroids.size())])
+    # [use cpu]
+    kmeans = faiss.Kmeans(npvecs.shape[1], ncls, seed=123, verbose=False,
+            min_points_per_centroid=2,
+            max_points_per_centroid=128)
+    kmeans.train(npvecs)
+    _, pred = kmeans.index.search(npvecs, 1)
+    pred = pred.flatten()
+    labels = pred
+    centroids = kmeans.centroids
+
     silc = silhouette_score(data, labels)
     return (labels, centroids, silc)
 
 
-def kmeans_auto(data, nbound: tuple, *, verbose=False) -> list:
+def kmeans_auto(data: np.ndarray, nbound: tuple, *, verbose=False) -> list:
     trials = list(map(
         lambda i: kmeans_trial(data, i),
         range(nbound[0], nbound[1]+1)))
@@ -46,13 +75,14 @@ def kmeans_auto(data, nbound: tuple, *, verbose=False) -> list:
     #        for i in range(nbound[0], nbound[1]+1))
     sil_argmax = np.argmax([x[-1] for x in trials])
     if verbose:
+        print(f'Sil score:', [(nbound[0]+i, trials[i][-1]) for i in range(len(trials))])
         print(f' kmeans_auto:',
         f'sil_argmax = {sil_argmax} <{nbound[0]+sil_argmax} classes>',
         f'| sil_max = {trials[sil_argmax][-1]:.4f} in [-1,1]')
     return (trials[sil_argmax][0], trials[sil_argmax][1].ravel())
 
 
-def kmeans_labelremap(data, centers, labels: list, *, verbose=False) -> list:
+def kmeans_labelremap(data: np.ndarray, centers, labels: list, *, verbose=False) -> list:
     '''
     kmeans classes are disordered.
     We remap the class label to assign cluster centers in high value with small
@@ -72,7 +102,21 @@ def kmeans_labelremap(data, centers, labels: list, *, verbose=False) -> list:
     return newlabel
 
 
-def AutoKmeans(data, bounds, verbose=False) -> list:
+def AutoKmeansPedantic(data: np.ndarray, bounds: tuple, verbose=False) -> tuple:
+    '''
+    Pedantic version of auto kmeans. Used for debugging / diagnosing.
+    '''
+    trials = list(map(lambda i: kmeans_trial(data, i), range(bounds[0], bounds[1]+1)))
+    for i, trial in enumerate(trials):
+        print()
+        print('i', bounds[0] + i, 'sil', trial[-1])
+        labels, centroids = trial[0], trial[1].ravel()
+        labels = kmeans_labelremap(data, centroids, labels, verbose=verbose)
+    am = np.argmax([x[-1] for x in trials])
+    return (bounds[0] + am, trials[am][-1])
+
+
+def AutoKmeans(data: np.ndarray, bounds, verbose=False) -> list:
     '''
     wrapper of the above kmeans_.* functions.
     bounds: e.g. k\in [2,5]
@@ -84,7 +128,7 @@ def AutoKmeans(data, bounds, verbose=False) -> list:
     return labels
 
 
-def BatchedAutoKmeans(batch, bounds, verbose=False) -> list:
+def BatchedAutoKmeans(batch: np.ndarray, bounds, preserve_zero=False, verbose=False) -> list:
     '''
     Batched version of AutoKmeans
     >>> This is Performane Bottleneck
@@ -94,11 +138,15 @@ def BatchedAutoKmeans(batch, bounds, verbose=False) -> list:
     #    for i in range(batch.shape[0]))
     def _worker(i):
         return AutoKmeans(batch[i].reshape(-1,1), bounds)
+    labels = tuple(map(_worker, range(batch.shape[0])))
     #with Pool(4) as pool:
     #    labels = pool.map(_worker, range(batch.shape[0]))
-    labels = Parallel(n_jobs=cpu_count()//2)(
-            delayed(_worker)(i) for i in range(batch.shape[0]))
+    #labels = Parallel(n_jobs=cpu_count()//2)(
+    #        delayed(_worker)(i) for i in range(batch.shape[0]))
     labels = np.vstack(labels)
+    if preserve_zero:
+        labels += 1
+        np.fill_diagonal(labels, 0)
     return labels
 
 
@@ -123,7 +171,7 @@ def AutoThresh(data, percentiles, verbose=False) -> list:
     return labels
 
 
-def BatchedAutoThresh(batch, percentiles, verbose=False) -> list:
+def BatchedAutoThresh(batch, percentiles, preserve_zero=False, verbose=False) -> list:
     '''
     Batched Fake Auto Kmeans
     we use np.percentile to calculate class labels for the data batch
@@ -131,6 +179,9 @@ def BatchedAutoThresh(batch, percentiles, verbose=False) -> list:
     labels = list(AutoThresh(batch[i], percentiles)
                 for i in range(batch.shape[0]))
     labels = np.vstack(labels)
+    if preserve_zero:
+        labels += 1
+        np.fill_diagonal(labels, 0)
     return labels
 
 
@@ -141,6 +192,13 @@ if __name__ == '__main__':
     def say(msg):
         print('\x1b[31;1m', msg, '\x1b[;m')
 
+    x = np.random.rand(10,1)
+    #x = [0.78679608, 0.10964481, 0.84435462, 0.16002031, 0.01853862, 0.73700576, 0.16565698, 0.92610943, 0.53560914, 0.73260908]
+    x = np.array(x).reshape(10, 1)
+    print(x)
+    print(AutoKmeansPedantic(x, [2,5], verbose=True))
+
+    exit(0)
     # unit test
     x = np.random.rand(5,1)
     say('Unit -- AutoKmeans')
@@ -152,10 +210,16 @@ if __name__ == '__main__':
     x = np.random.rand(10)
     print(x)
     print(AutoThresh(x, [70], verbose=True))
-    say('Unit -- BatcheAutoThresh')
+
+    say('Unit -- BatchedAutoThresh')
     x = np.random.rand(10,10)
     print(x)
-    print(BatchedAutoThresh(x, [70], verbose=True))
+    print(BatchedAutoThresh(x, [70], preserve_zero=False, verbose=True))
+    print(BatchedAutoThresh(x, [70], preserve_zero=True, verbose=True))
+
+    say('Unit -- BatchedAutoKmeans')
+    print(BatchedAutoKmeans(x, [2, 5], preserve_zero=False, verbose=True))
+    print(BatchedAutoKmeans(x, [2, 5], preserve_zero=True, verbose=True))
 
     # benchmark
     say('Bench -- BatchedAutoKmeans')

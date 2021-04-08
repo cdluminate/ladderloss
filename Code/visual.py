@@ -62,7 +62,7 @@ class CocoImRawDataset(Dataset):
             annotation['images'].extend(tmp['images'])
             self.images = annotation['images']
         elif self.DATASET == "F30K":
-            fjtrain = open('/niuz/dataset/flickr30k/dataset.json', 'r')
+            fjtrain = open(os.path.expanduser('~/dataset_flickr30k.json'), 'r')
             annotation = json.load(fjtrain)
             self.images = annotation['images']
     def __len__(self):
