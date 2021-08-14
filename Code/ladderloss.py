@@ -847,7 +847,7 @@ class AutoKmeansLadderLoss(th.nn.Module):
             when reldeg is not provided, ladder loss falls back to pwl.
             possible RDs: BowSim, EcoSTSMatrix, CoMatrix (IoU mode)
     '''
-    def __init__(self, bounds=None, *, reldeg=None, debug=False):
+    def __init__(self, bounds=None, *, reldeg=None, debug=False, cumulative=False):
         '''
         Instantiate LadderLoss function.
         '''
@@ -866,6 +866,7 @@ class AutoKmeansLadderLoss(th.nn.Module):
         self.debug = debug
         self.betas = [1.0, *[1./(2**(2+i)) for i in range(0,8)]]
         assert(len(self.margins) == len(self.betas))
+        self.cumulative = cumulative
 
     def forward(self, xs, vs, iids, sids):
         '''
@@ -906,6 +907,19 @@ class AutoKmeansLadderLoss(th.nn.Module):
                 preserve_zero=True)).float().to(device).t()
         # calculate adaptive ladder loss
         for l in range(1, np.max(self.bounds)):
+            if self.cumulative:
+                # ladder loss derived from the cumulated form of inequality
+                dismask_xv = (clmatrix_xv > l).float().to(device)
+                sc_dis_xv = scores * dismask_xv
+                xvld = np.sum(self.margins[0:l+1]) - diagonal.view(-1) + sc_dis_xv.max(dim=1)[0]
+                xvld = xvld.clamp(min=0.)
+                dismask_vx = (clmatrix_vx > l).float().to(device)
+                sc_dis_vx = scores * dismask_vx
+                vxld = np.sum(self.margins[0:l+1]) - diagonal.view(-1) + sc_dis_vx.max(dim=0)[0]
+                vxld = vxld.clamp(min=0.)
+                losses.append(self.betas[l] * (xvld.sum() + vxld.sum()))
+                continue
+
             # prevlad 0 has been processed in step 1
             # x->v direction
             simmask_xv = (clmatrix_xv <= l).float().to(device)
