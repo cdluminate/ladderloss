@@ -615,7 +615,7 @@ class LadderLoss(th.nn.Module):
     '''
 
     def __init__(self, margins=[0.2], *, thresholds=[], betas=[], reldeg=None,
-            accessories=[], debug=False):
+            accessories=[], cumulative=False, debug=False):
         '''
         Instantiate LadderLoss function.
         Note that you can adjust self.hard_negative to enable or disable
@@ -647,10 +647,17 @@ class LadderLoss(th.nn.Module):
                 any([not isinstance(x[1], callable) for x in accessories]):
             raise ValueError("wrong value for accessories")
         self.accessories = accessories
+        self.cumulative = cumulative
 
-    def forward(self, xs, vs, iids, sids):
+    def forward(self, xs, vs, iids, sids, cumulative=False):
         '''
         Forward pass.
+
+        forward pass derived using the cumulative form of inequality
+        s(q, q) - s(q, i) > a_1
+        s(q, q) - s(q, j) > a_2 + a_1
+        s(q, q) - s(q, k) > a+3 + a_2 + a_1
+        ...
         '''
         losses = []
         device = xs.device
@@ -681,17 +688,28 @@ class LadderLoss(th.nn.Module):
         if self.debug:
             print('LadderLoss>', 'sum(STSmat)=', rdmat.sum())
         for l, thre in enumerate(self.thresholds):
+            if not self.cumulative:
 
-            simmask = (rdmat >= thre).float()
-            dismask = (rdmat < thre).float()
-            gt_sim = scores * simmask + 1.0 * dismask
-            gt_dis = scores * dismask
-            xvld = self.margins[1+l] - gt_sim.min(dim=1)[0] + gt_dis.max(dim=1)[0]
-            xvld = xvld.clamp(min=0)
-            vxld = self.margins[1+l] - gt_sim.min(dim=0)[0] + gt_dis.max(dim=0)[0]
-            vxld = vxld.clamp(min=0)
+                simmask = (rdmat >= thre).float()
+                dismask = (rdmat < thre).float()
+                gt_sim = scores * simmask + 1.0 * dismask
+                gt_dis = scores * dismask
+                xvld = self.margins[1+l] - gt_sim.min(dim=1)[0] + gt_dis.max(dim=1)[0]
+                xvld = xvld.clamp(min=0)
+                vxld = self.margins[1+l] - gt_sim.min(dim=0)[0] + gt_dis.max(dim=0)[0]
+                vxld = vxld.clamp(min=0)
 
-            losses.append(self.betas[l] * (xvld.sum() + vxld.sum()))
+                losses.append(self.betas[l] * (xvld.sum() + vxld.sum()))
+            else:
+                # cumulative
+                dismask = (rdmat < thre).float()
+                gt_dis = scores * dismask
+                xvld = np.sum(self.margins[:l+2]) - diagonal.view(-1) + gt_dis.max(dim=1)[0]
+                xvld = xvld.clamp(min=0)
+                vxld = np.sum(self.margins[:l+2]) - diagonal.view(-1) + gt_dis.max(dim=0)[0]
+                vxld = vxld.clamp(min=0)
+
+                losses.append(self.betas[l] * (xvld.sum() + vxld.sum()))
 
         # deal with the additional loss accessories
         for (weight, call) in self.accessories:
