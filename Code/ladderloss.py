@@ -503,7 +503,8 @@ class EcoSTSMatrix(object):
     def __init__(self, coocthreshold=None, debug=False):
         assert (coocthreshold is not None)
         self.captions = CocoCaption()
-        self.cooc = CoMatrix()
+        #self.cooc = CoMatrix()
+        self.cooc = SpacySimMat()
         self.bertsts = BertSTSLiveClient()
         self.coocthreshold = coocthreshold
         self.debug = debug
